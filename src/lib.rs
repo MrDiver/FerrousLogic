@@ -14,6 +14,7 @@ pub mod bits;
 pub struct ComponentManager {
     counter: Cell<usize>,
     current_sim_time: u64,
+    component_library: ComponentLibrary,
     pin_update_queue: RwLock<BinaryHeap<PinUpdateEvent>>,
     gate_update_queue: RwLock<VecDeque<GateUpdateEvent>>,
     lump_update_queue: RwLock<VecDeque<LumpUpdateEvent>>,
@@ -27,6 +28,7 @@ impl ComponentManager {
         ComponentManager {
             counter: Cell::new(0),
             current_sim_time: 0,
+            component_library: ComponentLibrary::new(),
             pin_update_queue: RwLock::new(BinaryHeap::new()),
             gate_update_queue: RwLock::new(VecDeque::new()),
             lump_update_queue: RwLock::new(VecDeque::new()),
@@ -54,30 +56,21 @@ impl ComponentManager {
         return id;
     }
 
-    #[instrument(skip(self), ret)]
-    fn get_gate_inputs(&self, gate_id: &usize) -> Option<Vec<usize>> {
-        warn!("STOP USING THIS");
-        match self.gates.read().unwrap().get(gate_id) {
-            Some(gate) => Some(gate.gpio.in_pins.clone()),
-            None => None,
-        }
+    fn create_gate(&mut self, name: &str) -> Result<usize, &str> {
+        let gate = self.component_library.construct_gate(name, &self).unwrap();
+        Ok(self.accept_gate(gate))
     }
 
     #[instrument(skip(self), ret)]
-    fn get_gate_outputs(&self, gate_id: &usize) -> Option<Vec<usize>> {
+    fn get_gate_pins(&self, gate_id: &usize, pin_type: &PinType) -> Vec<usize> {
         warn!("STOP USING THIS");
-        match self.gates.read().unwrap().get(gate_id) {
-            Some(gate) => Some(gate.gpio.out_pins.clone()),
-            None => None,
-        }
-    }
+        let gates = self.gates.read().unwrap();
+        let gate = gates.get(gate_id).unwrap();
 
-    #[instrument(skip(self), ret)]
-    fn get_gate_inouts(&self, gate_id: &usize) -> Option<Vec<usize>> {
-        warn!("STOP USING THIS");
-        match self.gates.read().unwrap().get(gate_id) {
-            Some(gate) => Some(gate.gpio.inout_pins.clone()),
-            None => None,
+        match &pin_type {
+            PinType::IN => gate.gpio.in_pins.clone(),
+            PinType::OUT => gate.gpio.out_pins.clone(),
+            PinType::INOUT => gate.gpio.inout_pins.clone(),
         }
     }
 
@@ -87,7 +80,12 @@ impl ComponentManager {
         return id;
     }
 
-    fn connect_pin_to_lump(&mut self, pin_id: &usize, lump_id: &usize) {
+    fn create_lump(&mut self, n: usize) -> usize {
+        let lump = Lump::new(self.get_id(), n, self);
+        self.accept_lump(lump)
+    }
+
+    fn connect_pin_to_lump(&mut self, pin_id: &usize, lump_id: &usize) -> Result<(), String> {
         let mut pins = self.pins.write().unwrap();
         let pin = pins.get_mut(&pin_id);
         let mut lumps = self.lumps.write().unwrap();
@@ -95,6 +93,12 @@ impl ComponentManager {
         if let (Some(pin), Some(lump)) = (pin, lump) {
             pin.connect(lump_id);
             lump.connect(pin_id);
+            Ok(())
+        } else {
+            Err(format!(
+                "Either pin with id {} or lump with id {} doesn't exist",
+                pin_id, lump_id,
+            ))
         }
     }
 
@@ -109,12 +113,23 @@ impl ComponentManager {
         }
     }
 
+    fn connect_gate_pin_to_lump(
+        &mut self,
+        gate_id: &usize,
+        pin_idx: &usize,
+        pin_type: &PinType,
+        lump_id: &usize,
+    ) -> Result<(), String> {
+        let pins = self.get_gate_pins(gate_id, pin_type);
+        self.connect_pin_to_lump(&pins[*pin_idx], lump_id)
+    }
+
     fn get_pin_value(&self, pin_id: &usize) -> Bits {
         self.pins
             .read()
             .unwrap()
             .get(pin_id)
-            .expect("The pin doesn´t exist")
+            .expect(format!("The pin with id {} doesn't exist", pin_id).as_str())
             .value
             .clone()
     }
@@ -124,7 +139,7 @@ impl ComponentManager {
             .read()
             .unwrap()
             .get(lump_id)
-            .expect("The pin doesn´t exist")
+            .expect(format!("The lump with id {} doesn't exist", lump_id).as_str())
             .value
             .clone()
     }
@@ -429,6 +444,12 @@ struct ComponentLibrary {
     constructors: HashMap<&'static str, GateConstructor>,
 }
 
+impl std::fmt::Debug for ComponentLibrary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ComponentLibrary").finish()
+    }
+}
+
 impl ComponentLibrary {
     fn new() -> ComponentLibrary {
         let mut constructors = HashMap::new();
@@ -475,39 +496,37 @@ impl ComponentLibrary {
         ComponentLibrary { constructors }
     }
 
-    fn construct_gate(&self, name: &str, cm: &ComponentManager) -> GenericGate {
-        GenericGate::new(
-            cm.get_id(),
-            self.constructors
-                .get(name)
-                .expect("Why are you trying to create something that doesn't exist?"),
-            cm,
-        )
+    fn construct_gate(&self, name: &str, cm: &ComponentManager) -> Result<GenericGate, String> {
+        if self.constructors.contains_key(name) {
+            Ok(GenericGate::new(
+                cm.get_id(),
+                self.constructors.get(name).unwrap(),
+                cm,
+            ))
+        } else {
+            Err(format!("Gate with name {} does not exist", name))
+        }
     }
 }
 
 pub fn lib_main() {
     info!("Maybe Works");
     let mut cm = ComponentManager::new();
-    let lib = ComponentLibrary::new();
-    let and = lib.construct_gate("and", &cm);
-    let lump = Lump::new(0, 1, &cm);
-    cm.accept_gate(and);
-    cm.accept_lump(lump);
-    cm.connect_pin_to_lump(&4, &0);
-    let ids: Vec<usize> = cm.pins.read().unwrap().iter().map(|(_, v)| v.id).collect();
-    println!("Pins: {:?}", ids);
+    let and = cm.create_gate("and").unwrap();
+    let lump = cm.create_lump(1);
+    cm.connect_gate_pin_to_lump(&and, &0, &PinType::OUT, &lump)
+        .unwrap();
     println!("A: {} ", cm.get_pin_value(&2));
     println!("B: {} ", cm.get_pin_value(&3));
     println!("C: {} ", cm.get_pin_value(&4));
+    println!("L: {}", cm.get_lump_value(&lump));
     cm.schedule_pin_update(0, 2, Bits::new(1).set_num(1));
     cm.schedule_pin_update(0, 3, Bits::new(1).set_num(1));
     println!("{:?}", cm.pin_update_queue);
     cm.process_pin_events();
-    cm.process_pin_events();
-    println!("{:?}", cm.pin_update_queue);
+    // cm.process_pin_events();
     println!("A: {} ", cm.get_pin_value(&2));
     println!("B: {} ", cm.get_pin_value(&3));
     println!("C: {} ", cm.get_pin_value(&4));
-    println!("L: {}", cm.get_lump_value(&0));
+    println!("L: {}", cm.get_lump_value(&lump));
 }
