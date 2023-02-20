@@ -1,36 +1,39 @@
 use std::{fmt::Display, iter::zip};
 
-#[derive(Eq, PartialEq, Clone, Copy, Debug)]
+use wasm_bindgen::prelude::wasm_bindgen;
+
+#[derive(Eq, PartialEq, Clone)]
+#[wasm_bindgen]
 pub enum LV {
-    H,
-    L,
-    X,
-    Z,
+    H = 0,
+    L = 1,
+    X = 2,
+    Z = 3,
 }
 
 impl LV {
-    pub fn and(self, other: LV) -> LV {
-        match (self, other) {
+    pub fn and(&self, other: &LV) -> LV {
+        match (&self, &other) {
             (LV::L, _) => LV::L,
             (_, LV::L) => LV::L,
             (LV::Z, LV::H) => LV::X,
-            (a, LV::H) => a,
+            (&a, LV::H) => a.clone(),
             (LV::H, LV::Z) => LV::X,
-            (LV::H, b) => b,
+            (LV::H, &b) => b.clone(),
             (LV::X, LV::X) => LV::X,
             (LV::X, LV::Z) => LV::X,
             (LV::Z, LV::X) => LV::X,
             (LV::Z, LV::Z) => LV::X,
         }
     }
-    pub fn or(self, other: LV) -> LV {
-        match (self, other) {
+    pub fn or(&self, other: &LV) -> LV {
+        match (&self, &other) {
             (LV::H, _) => LV::H,
             (_, LV::H) => LV::H,
             (LV::L, LV::Z) => LV::X,
-            (LV::L, b) => b,
+            (LV::L, &b) => b.clone(),
             (LV::Z, LV::L) => LV::X,
-            (a, LV::L) => a,
+            (&a, LV::L) => a.clone(),
             (LV::X, LV::X) => LV::X,
             (LV::Z, LV::X) => LV::X,
             (LV::X, LV::Z) => LV::X,
@@ -49,11 +52,17 @@ impl LV {
 
 impl Display for LV {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {
-            LV::H => write!(f, "{}", "1"),
-            LV::L => write!(f, "{}", "0"),
-            LV::X => write!(f, "{}", "X"),
-            LV::Z => write!(f, "{}", "Z"),
+        write!(f, "{:?}", self)
+    }
+}
+
+impl std::fmt::Debug for LV {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::H => write!(f, "1"),
+            Self::L => write!(f, "0"),
+            Self::X => write!(f, "X"),
+            Self::Z => write!(f, "Z"),
         }
     }
 }
@@ -83,7 +92,7 @@ impl Bits {
     }
 
     pub fn get(&self, idx: usize) -> LV {
-        self.value[idx]
+        self.value[idx].clone()
     }
 
     pub fn len(&self) -> usize {
@@ -95,7 +104,7 @@ impl Bits {
             panic!("Can't compare bits of different sizes");
         }
         let value = zip(&self.value, &other.value)
-            .map(|(a, b)| a.and(*b))
+            .map(|(a, b)| a.and(b))
             .collect();
         Bits { value }
     }
@@ -104,7 +113,7 @@ impl Bits {
             panic!("Can't compare bits of different sizes");
         }
         let value = zip(&self.value, &other.value)
-            .map(|(a, b)| a.or(*b))
+            .map(|(a, b)| a.or(b))
             .collect();
         Bits { value }
     }
@@ -119,5 +128,43 @@ impl Bits {
         }
         let value = (start..end).map(|i| self.get(i)).collect();
         Ok(Bits { value })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lv_and() {
+        assert!(LV::H.and(&LV::L) == LV::L);
+        assert!(LV::L.and(&LV::H) == LV::L);
+        assert!(LV::L.and(&LV::X) == LV::L);
+        assert!(LV::H.and(&LV::H) == LV::H);
+        assert!(LV::H.and(&LV::Z) == LV::X);
+        assert!(LV::H.and(&LV::X) == LV::X);
+    }
+
+    #[test]
+    fn test_lv_or() {
+        assert!(LV::L.or(&LV::L) == LV::L);
+        assert!(LV::H.or(&LV::L) == LV::H);
+        assert!(LV::L.or(&LV::H) == LV::H);
+        assert!(LV::Z.or(&LV::H) == LV::H);
+        assert!(LV::Z.or(&LV::L) == LV::X);
+        assert!(LV::X.or(&LV::L) == LV::X);
+    }
+
+    #[test]
+    fn test_lv_not() {
+        assert!(LV::H.not() == LV::L);
+        assert!(LV::L.not() == LV::H);
+        assert!(LV::Z.not() == LV::X);
+        assert!(LV::X.not() == LV::X);
+    }
+
+    #[test]
+    fn test_bits_subrange() {
+        let tmp = Bits::new(8);
     }
 }
