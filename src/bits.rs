@@ -91,6 +91,16 @@ impl Bits {
         self.value[idx] = value;
     }
 
+    pub fn set_num(mut self, value: i64) -> Bits {
+        let mut value = value;
+        let len = self.value.len();
+        for i in 0..len {
+            self.value[i] = if value & 1 == 1 { LV::H } else { LV::L };
+            value = value >> 1;
+        }
+        return self;
+    }
+
     pub fn get(&self, idx: usize) -> LV {
         self.value[idx].clone()
     }

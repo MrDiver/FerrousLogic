@@ -1,7 +1,9 @@
+mod events;
+use events::{GateUpdateEvent, LumpUpdateEvent, PinUpdateEvent};
 use std::{
     cell::Cell,
     collections::{BinaryHeap, HashMap, VecDeque},
-    sync::RwLock,
+    sync::{Arc, RwLock},
 };
 
 use bits::Bits;
@@ -17,7 +19,7 @@ pub struct ComponentManager {
     lump_update_queue: RwLock<VecDeque<LumpUpdateEvent>>,
     pins: RwLock<HashMap<usize, Pin>>,
     lumps: RwLock<HashMap<usize, Lump>>,
-    gates: RwLock<HashMap<usize, Box<dyn Gate>>>,
+    gates: RwLock<HashMap<usize, GenericGate>>,
 }
 
 impl ComponentManager {
@@ -46,9 +48,9 @@ impl ComponentManager {
         return id;
     }
 
-    fn accept_gate(&mut self, gate: Box<dyn Gate>) -> usize {
-        let id = gate.get_id();
-        self.gates.write().unwrap().insert(gate.get_id(), gate);
+    fn accept_gate(&mut self, gate: GenericGate) -> usize {
+        let id = gate.id;
+        self.gates.write().unwrap().insert(gate.id, gate);
         return id;
     }
 
@@ -56,7 +58,7 @@ impl ComponentManager {
     fn get_gate_inputs(&self, gate_id: &usize) -> Option<Vec<usize>> {
         warn!("STOP USING THIS");
         match self.gates.read().unwrap().get(gate_id) {
-            Some(gate) => Some(gate.gpio().in_pins.clone()),
+            Some(gate) => Some(gate.gpio.in_pins.clone()),
             None => None,
         }
     }
@@ -65,7 +67,7 @@ impl ComponentManager {
     fn get_gate_outputs(&self, gate_id: &usize) -> Option<Vec<usize>> {
         warn!("STOP USING THIS");
         match self.gates.read().unwrap().get(gate_id) {
-            Some(gate) => Some(gate.gpio().out_pins.clone()),
+            Some(gate) => Some(gate.gpio.out_pins.clone()),
             None => None,
         }
     }
@@ -74,7 +76,7 @@ impl ComponentManager {
     fn get_gate_inouts(&self, gate_id: &usize) -> Option<Vec<usize>> {
         warn!("STOP USING THIS");
         match self.gates.read().unwrap().get(gate_id) {
-            Some(gate) => Some(gate.gpio().inout_pins.clone()),
+            Some(gate) => Some(gate.gpio.inout_pins.clone()),
             None => None,
         }
     }
@@ -112,6 +114,16 @@ impl ComponentManager {
             .read()
             .unwrap()
             .get(pin_id)
+            .expect("The pin doesn´t exist")
+            .value
+            .clone()
+    }
+
+    fn get_lump_value(&self, lump_id: &usize) -> Bits {
+        self.lumps
+            .read()
+            .unwrap()
+            .get(lump_id)
             .expect("The pin doesn´t exist")
             .value
             .clone()
@@ -171,6 +183,7 @@ impl ComponentManager {
     pub fn process_pin_events(&mut self) {
         info!("Start Processing Events at time {}", self.current_sim_time);
         loop {
+            println!("{:?}", self.pin_update_queue.read().unwrap());
             if let Some(event) = self.pin_update_queue.read().unwrap().peek() {
                 info!("Processing Event: {}", event.time);
                 // If not in same time step break
@@ -264,12 +277,6 @@ impl Pin {
 }
 
 #[derive(Debug)]
-struct LumpUpdateEvent {
-    sender_pin_id: usize,
-    target_lump_id: usize,
-    bits: Bits,
-}
-#[derive(Debug)]
 pub struct Lump {
     id: usize,
     pin_ids: Vec<usize>,
@@ -349,11 +356,11 @@ impl GPIOHandler {
     fn handle_gate_event(
         &self,
         event: &GateUpdateEvent,
-        logic_callback: &dyn Fn(GateUpdateData, &dyn Fn(u64, usize, Bits)),
+        logic_callback: &dyn Fn(&GateUpdateData, &dyn Fn(u64, usize, Bits)),
         cm: &ComponentManager,
     ) {
         logic_callback(
-            GateUpdateData {
+            &GateUpdateData {
                 in_values: self.in_pins.iter().map(|id| cm.get_pin_value(id)).collect(),
                 inout_values: self
                     .inout_pins
@@ -378,91 +385,114 @@ impl GPIOHandler {
     }
 }
 
-#[derive(Debug)]
-pub struct GateUpdateEvent {
-    sender_pin_id: usize,
-    target_gate_id: usize,
+type PinInitFunc = Box<dyn Fn(&mut GPIOHandler, &ComponentManager)>;
+type LogicUpdaterFunc = Box<dyn Fn(&GateUpdateData, &dyn Fn(u64, usize, Bits))>;
+
+struct GateConstructor {
+    init: PinInitFunc,
+    update: Arc<LogicUpdaterFunc>,
 }
-pub trait Gate: std::fmt::Debug {
-    fn get_id(&self) -> usize;
-    fn gpio(&self) -> &GPIOHandler;
-    fn update_logic(&self, data: GateUpdateData, dispatch_output_update: &dyn Fn(u64, usize, Bits));
-    //#[instrument(skip_all, fields(gate_id = event.target_gate_id))]
+
+struct GenericGate {
+    id: usize,
+    gpio: GPIOHandler,
+    update_logic: Arc<LogicUpdaterFunc>,
+}
+
+impl std::fmt::Debug for GenericGate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GenericGate")
+            .field("id", &self.id)
+            .field("gpio", &self.gpio)
+            .finish()
+    }
+}
+
+impl GenericGate {
+    fn new(id: usize, con: &GateConstructor, cm: &ComponentManager) -> GenericGate {
+        let mut gpio = GPIOHandler::new(id);
+        con.init.as_ref()(&mut gpio, cm);
+        GenericGate {
+            id,
+            gpio,
+            update_logic: con.update.clone(),
+        }
+    }
+
     fn handle_gate_event(&self, event: &GateUpdateEvent, cm: &ComponentManager) {
-        self.gpio().handle_gate_event(
-            event,
-            &|data, dispatch_output_update| self.update_logic(data, dispatch_output_update),
+        self.gpio
+            .handle_gate_event(event, self.update_logic.as_ref(), cm)
+    }
+}
+
+struct ComponentLibrary {
+    constructors: HashMap<&'static str, GateConstructor>,
+}
+
+impl ComponentLibrary {
+    fn new() -> ComponentLibrary {
+        let mut constructors = HashMap::new();
+        let and: GateConstructor = GateConstructor {
+            init: Box::new(|gpio, cm| {
+                gpio.add_in(1, cm);
+                gpio.add_in(1, cm);
+                gpio.add_out(1, cm);
+            }),
+            update: Arc::new(Box::new(|data, dispatch_output_update| {
+                let a = &data.in_values[0];
+                let b = &data.in_values[1];
+                dispatch_output_update(1, 0, a.and(&b));
+            })),
+        };
+        constructors.insert("and", and);
+
+        let or: GateConstructor = GateConstructor {
+            init: Box::new(|gpio, cm| {
+                gpio.add_in(1, cm);
+                gpio.add_in(1, cm);
+                gpio.add_out(1, cm);
+            }),
+            update: Arc::new(Box::new(|data, dispatch_output_update| {
+                let a = &data.in_values[0];
+                let b = &data.in_values[1];
+                dispatch_output_update(1, 0, a.or(&b));
+            })),
+        };
+        constructors.insert("or", or);
+
+        let not: GateConstructor = GateConstructor {
+            init: Box::new(|gpio, cm| {
+                gpio.add_in(1, cm);
+                gpio.add_out(1, cm);
+            }),
+            update: Arc::new(Box::new(|data, dispatch_output_update| {
+                let a = &data.in_values[0];
+                dispatch_output_update(1, 0, a.not());
+            })),
+        };
+        constructors.insert("not", not);
+
+        ComponentLibrary { constructors }
+    }
+
+    fn construct_gate(&self, name: &str, cm: &ComponentManager) -> GenericGate {
+        GenericGate::new(
+            cm.get_id(),
+            self.constructors
+                .get(name)
+                .expect("Why are you trying to create something that doesn't exist?"),
             cm,
         )
     }
 }
 
-#[derive(Debug)]
-struct AND {
-    id: usize,
-    gpio: GPIOHandler,
-}
-impl AND {
-    fn new(id: usize, cm: &ComponentManager) -> Self {
-        let mut gpio = GPIOHandler::new(id);
-        gpio.add_in(1, cm);
-        gpio.add_in(1, cm);
-        gpio.add_out(1, cm);
-        AND { id, gpio }
-    }
-}
-impl Gate for AND {
-    fn gpio(&self) -> &GPIOHandler {
-        &self.gpio
-    }
-
-    fn update_logic(
-        &self,
-        data: GateUpdateData,
-        dispatch_output_update: &dyn Fn(u64, usize, Bits),
-    ) {
-        let a = &data.in_values[0];
-        let b = &data.in_values[1];
-        dispatch_output_update(1, 0, a.and(b));
-    }
-
-    fn get_id(&self) -> usize {
-        self.id
-    }
-}
-
-#[derive(Debug)]
-pub struct PinUpdateEvent {
-    time: u64,
-    target_pin_id: usize,
-    value: Bits,
-}
-
-impl Ord for PinUpdateEvent {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.time.cmp(&other.time)
-    }
-}
-
-impl PartialOrd for PinUpdateEvent {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.time.partial_cmp(&other.time)
-    }
-}
-
-impl PartialEq for PinUpdateEvent {
-    fn eq(&self, other: &Self) -> bool {
-        self.time == other.time
-    }
-}
-impl Eq for PinUpdateEvent {}
-
 pub fn lib_main() {
     info!("Maybe Works");
     let mut cm = ComponentManager::new();
-    let and = AND::new(cm.get_id(), &cm);
+    let lib = ComponentLibrary::new();
+    let and = lib.construct_gate("and", &cm);
     let lump = Lump::new(0, 1, &cm);
-    cm.accept_gate(Box::new(and));
+    cm.accept_gate(and);
     cm.accept_lump(lump);
     cm.connect_pin_to_lump(&4, &0);
     let ids: Vec<usize> = cm.pins.read().unwrap().iter().map(|(_, v)| v.id).collect();
@@ -470,14 +500,14 @@ pub fn lib_main() {
     println!("A: {} ", cm.get_pin_value(&2));
     println!("B: {} ", cm.get_pin_value(&3));
     println!("C: {} ", cm.get_pin_value(&4));
-    cm.schedule_pin_update(0, 2, Bits::new(1).not());
+    cm.schedule_pin_update(0, 2, Bits::new(1).set_num(1));
+    cm.schedule_pin_update(0, 3, Bits::new(1).set_num(1));
     println!("{:?}", cm.pin_update_queue);
     cm.process_pin_events();
-    println!("{:?}", cm.pin_update_queue);
     cm.process_pin_events();
     println!("{:?}", cm.pin_update_queue);
     println!("A: {} ", cm.get_pin_value(&2));
     println!("B: {} ", cm.get_pin_value(&3));
     println!("C: {} ", cm.get_pin_value(&4));
-    println!("{:?}", cm.pin_update_queue);
+    println!("L: {}", cm.get_lump_value(&0));
 }
